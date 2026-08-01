@@ -12,7 +12,7 @@ app = Flask(__name__)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 DB_PATH = "/tmp/invoice_agent.db"
-BASE_URL = os.environ.get("BASE_URL", "")  # Set on Render
+BASE_URL = os.environ.get("BASE_URL", "https://invoice-agent-7py5.onrender.com")  # Set on Render
 
 _local = threading.local()
 
@@ -77,11 +77,11 @@ def make_resp(obj, status=200, media_type="application/json"):
 
 
 def a2a_resp(obj, status=200):
-    return Response(json.dumps(obj), status=status, content_type="application/json")
+    return Response(json.dumps(obj), status=status, content_type="application/a2a+json")
 
 
 def error_resp(code, message, status=400):
-    return Response(json.dumps({"error": {"code": code, "message": message}}), status=status, content_type="application/json")
+    return Response(json.dumps({"error": {"code": code, "message": message}}), status=status, content_type="application/a2a+json")
 
 
 def get_principal():
@@ -493,7 +493,7 @@ def build_task_response(task_id, context_id, status, history):
             "history": trimmed
         }
     }
-    return Response(json.dumps(task), status=200, content_type="application/json")
+    return Response(json.dumps(task), status=200, content_type="application/a2a+json")
 
 
 @app.route("/tasks/<task_id>", methods=["GET"])
@@ -534,7 +534,7 @@ def list_tasks():
             "history": history[-20:]
         })
 
-    return Response(json.dumps({"tasks": tasks}), status=200, content_type="application/json")
+    return Response(json.dumps({"tasks": tasks}), status=200, content_type="application/a2a+json")
 
 
 @app.route("/tasks/<task_id>:cancel", methods=["POST"])
