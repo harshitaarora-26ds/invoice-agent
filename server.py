@@ -4,7 +4,7 @@ import hashlib
 import sqlite3
 import uuid
 import threading
-from flask import Flask, request, Response, g
+from flask import Flask, request, Response
 import requests as http_requests
 
 app = Flask(__name__)
@@ -12,7 +12,7 @@ app = Flask(__name__)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 DB_PATH = "/tmp/invoice_agent.db"
-BASE_URL = os.environ.get("BASE_URL", "https://invoice-agent-7py5.onrender.com")  # Set on Render
+BASE_URL = os.environ.get("BASE_URL", "https://invoice-agent-7py5.onrender.com")
 
 _local = threading.local()
 
@@ -33,8 +33,10 @@ def init_db():
             task_id TEXT PRIMARY KEY,
             principal TEXT NOT NULL,
             context_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'INPUT_REQUIRED',
+            status TEXT NOT NULL DEFAULT 'TASK_STATE_INPUT_REQUIRED',
             history_json TEXT NOT NULL DEFAULT '[]',
+            proposals_json TEXT NOT NULL DEFAULT '{}',
+            batch_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS message_dedup (
@@ -55,58 +57,64 @@ def init_db():
 init_db()
 
 
-# ─── Utilities ───
-
 def canonical_json(obj):
     return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
-
 
 def sha256_hex(data):
     if isinstance(data, str):
         data = data.encode('utf-8')
     return hashlib.sha256(data).hexdigest()
 
-
 def new_id():
     return uuid.uuid4().hex
 
-
-def make_resp(obj, status=200, media_type="application/json"):
-    body = json.dumps(obj)
-    return Response(body, status=status, content_type=media_type)
-
-
-def a2a_resp(obj, status=200):
+def a2a_response(obj, status=200):
     return Response(json.dumps(obj), status=status, content_type="application/a2a+json")
 
-
-def error_resp(code, message, status=400):
-    return Response(json.dumps({"error": {"code": code, "message": message}}), status=status, content_type="application/a2a+json")
+def a2a_error(code, message, status=400):
+    body = {"jsonrpc": "2.0", "error": {"code": code, "message": message}}
+    return Response(json.dumps(body), status=status, content_type="application/a2a+json")
 
 
 def get_principal():
-    """Extract bearer token as principal. Returns None if missing."""
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        return auth[7:].strip()
+        token = auth[7:].strip()
+        if token:
+            return token
     return None
 
 
-def hash_message(msg):
-    """Hash canonical message content (excluding configuration)."""
-    msg_copy = {k: v for k, v in msg.items() if k != "configuration"}
-    return sha256_hex(canonical_json(msg_copy))
+def check_a2a_headers():
+    """Check A2A version and content type. Returns error response or None."""
+    # Check A2A-Version header
+    version = request.headers.get("A2A-Version", "")
+    if version and version != "1.0":
+        return a2a_error("VERSION_NOT_SUPPORTED", "Only A2A-Version: 1.0 is supported", 400)
+    if not version:
+        return a2a_error("VERSION_REQUIRED", "A2A-Version header required", 400)
+
+    # Check content type for POST
+    if request.method == "POST":
+        ct = request.content_type or ""
+        if "application/a2a+json" not in ct:
+            return a2a_error("INVALID_MEDIA_TYPE", "Content-Type must be application/a2a+json", 400)
+
+    return None
+
+
+def hash_message_content(msg):
+    """Hash the canonical message content (only the 'message' field, ignoring configuration)."""
+    return sha256_hex(canonical_json(msg))
 
 
 # ─── AI Decision ───
 
 def classify_package(package, policy_revision):
-    """Use AI to classify an invoice package into an action."""
-    # Build content for LLM
     docs_text = ""
     ref_ids = []
-    for i, doc in enumerate(package.get("documents", [])):
-        docs_text += f"\n--- Document {i+1}: {doc.get('title', '')} (ref: {doc.get('referenceId', '')}) ---\n"
+    for doc in package.get("documents", []):
+        docs_text += f"\n--- {doc.get('title', '')} (ref: {doc.get('referenceId', '')}) ---\n"
         for para in doc.get("paragraphs", []):
             refs = para.get("refs", [])
             ref_ids.extend(refs)
@@ -118,35 +126,28 @@ def classify_package(package, policy_revision):
     amount = package.get("amountMinor", 0)
     currency = package.get("currency", "INR")
 
-    prompt = f"""You are an invoice action classifier. Analyze this invoice package and choose exactly ONE action.
+    prompt = f"""You are an invoice action classifier. Choose exactly ONE action for this package.
 
-POLICY REVISION: {policy_revision}
-
-PACKAGE:
-  packageId: {pkg_id}
-  vendorName: {vendor}
-  invoiceNumber: {invoice_num}
-  amountMinor: {amount}
-  currency: {currency}
+PACKAGE: vendorName={vendor}, invoiceNumber={invoice_num}, amountMinor={amount}, currency={currency}
 
 DOCUMENTS:
 {docs_text}
 
-ACTIONS (choose exactly one):
-- settle_invoice: Valid, reconciled, and within autonomous authority. Use when all documents confirm the invoice is legitimate, reconciled with PO/delivery, and within approval limits.
-- request_approval: Commercially valid, but outside delegated authority. Use when invoice is valid but amount exceeds autonomous settlement threshold or needs manager sign-off.
-- hold_invoice: Payment pauses until a stated verification completes. Use when documents indicate pending verification, missing confirmation, or unresolved query.
-- reject_duplicate: The same commercial invoice was already paid. Use when documents show this exact invoice number was previously settled/paid.
-- open_exception: Material records conflict and need an exception workflow. Use when documents show contradictions, mismatches between PO and invoice, or pricing discrepancies.
+ACTIONS:
+- settle_invoice: Valid, reconciled, within autonomous authority
+- request_approval: Valid but outside delegated authority (needs manager approval)
+- hold_invoice: Payment pauses until verification completes
+- reject_duplicate: Same invoice was already paid
+- open_exception: Material records conflict
 
-INSTRUCTIONS:
-- Read ALL documents carefully. Look for: reconciliation status, approval notes, duplicate flags, amount thresholds, verification status.
-- The decisive paragraph is the one that DETERMINES the action — often from an internal system or authority note.
-- Ignore training decoys, old examples, and irrelevant action words. Focus on the CURRENT STATE of this package.
-- Return EXACTLY 3 evidence refs from the decisive paragraph (the one that determines your action). Do NOT include cover-sheet refs, archive refs, or training decoys.
+RULES:
+- Focus on the DECISIVE paragraph — the one from the authoritative/controlling source that determines the outcome.
+- Return exactly 3 bracketed reference IDs from that decisive paragraph.
+- Ignore cover sheets, archive references, training examples, and decoys.
+- Look for: reconciliation status, duplicate flags, approval limits, verification pending, conflicts.
 
-Respond with ONLY JSON:
-{{"action":"<one action>","evidenceRefs":["ref1","ref2","ref3"],"rationale":"<60-1500 chars: name the action, explain why based on evidence>"}}"""
+Return ONLY JSON:
+{{"action":"<name>","evidenceRefs":["ref1","ref2","ref3"],"rationale":"<explain how evidence supports action, 60-1500 chars>"}}"""
 
     try:
         resp = http_requests.post(
@@ -172,52 +173,40 @@ Respond with ONLY JSON:
         if result.get("action") not in valid_actions:
             result["action"] = "hold_invoice"
 
-        # Validate refs
         valid_refs = set(ref_ids)
         evidence = [r for r in result.get("evidenceRefs", []) if r in valid_refs]
-        if len(evidence) < 2 and ref_ids:
+        if len(evidence) < 2:
             evidence = ref_ids[:3]
         result["evidenceRefs"] = evidence[:5]
-
         if not result.get("rationale"):
-            result["rationale"] = f"Action {result['action']} chosen based on document analysis."
-
+            result["rationale"] = f"Action {result['action']} based on document analysis."
         return result
     except Exception:
-        return {
-            "action": "hold_invoice",
-            "evidenceRefs": ref_ids[:3] if ref_ids else [],
-            "rationale": "Held for manual review due to classification error."
-        }
+        return {"action": "hold_invoice", "evidenceRefs": ref_ids[:3], "rationale": "Held for review due to processing error."}
 
 
 # ─── Agent Card ───
 
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 def agent_card():
-    base = BASE_URL or request.url_root.rstrip("/")
     card = {
         "name": "Invoice Action Agent",
-        "description": "Classifies invoice packages and proposes settlement actions per policy.",
+        "description": "Reads invoice claim batches and proposes one settlement action per package.",
         "version": "1.0.0",
         "capabilities": {
             "streaming": False,
             "pushNotifications": False
         },
-        "skills": [
-            {
-                "name": "invoice_action_agent",
-                "description": "Reads invoice claim batches and proposes one action per package.",
-                "tags": ["invoice", "finance", "classification"]
-            }
-        ],
-        "supportedInterfaces": [
-            {
-                "protocolBinding": "HTTP+JSON",
-                "protocolVersion": "1.0",
-                "url": base
-            }
-        ],
+        "skills": [{
+            "name": "invoice_action_agent",
+            "description": "Classifies invoice packages and proposes settlement actions per policy.",
+            "tags": ["invoice", "finance"]
+        }],
+        "supportedInterfaces": [{
+            "protocolBinding": "HTTP+JSON",
+            "protocolVersion": "1.0",
+            "url": BASE_URL
+        }],
         "defaultInputModes": [
             "application/vnd.ga5.invoice-claim-batch+json"
         ],
@@ -229,72 +218,56 @@ def agent_card():
     return Response(json.dumps(card), content_type="application/json")
 
 
-# ─── A2A Endpoints ───
+# ─── A2A Routes ───
 
 @app.route("/message:send", methods=["POST"])
 def message_send():
-    # Auth check
+    # Auth
     principal = get_principal()
     if not principal:
-        return error_resp("UNAUTHORIZED", "Missing Bearer token", 401)
+        return a2a_error("ROLE_USER", "Missing or invalid Bearer token", 401)
 
-    # Version check
-    a2a_version = request.headers.get("A2A-Version", "")
-    if a2a_version != "1.0":
-        return error_resp("VERSION_NOT_SUPPORTED", "Require A2A-Version: 1.0", 400)
-
-    # Content type check
-    ct = request.content_type or ""
-    if "application/a2a+json" not in ct and "application/json" not in ct:
-        return error_resp("INVALID_MEDIA_TYPE", "Require application/a2a+json", 400)
+    # A2A version + media type
+    err = check_a2a_headers()
+    if err:
+        return err
 
     try:
         data = request.get_json(force=True)
     except Exception:
-        return error_resp("INVALID_REQUEST", "Invalid JSON", 400)
+        return a2a_error("INVALID_REQUEST", "Invalid JSON body", 400)
 
     msg = data.get("message")
-    if not msg:
-        return error_resp("INVALID_REQUEST", "Missing message", 400)
+    if not msg or not isinstance(msg, dict):
+        return a2a_error("INVALID_REQUEST", "Missing message field", 400)
 
-    message_id = msg.get("messageId")
-    role = msg.get("role")
-    parts = msg.get("parts", [])
     task_id = msg.get("taskId")
+    if task_id:
+        return handle_continuation(principal, msg, data)
+    else:
+        return handle_new_task(principal, msg, data)
+
+
+def handle_new_task(principal, msg, data):
+    message_id = msg.get("messageId", "")
     context_id = msg.get("contextId", new_id())
+    parts = msg.get("parts", [])
+    config = data.get("configuration", {})
 
-    if role != "ROLE_USER":
-        return error_resp("INVALID_REQUEST", "Expected ROLE_USER", 400)
-
+    # Dedup by message content
+    msg_hash = hash_message_content(msg)
     db = get_db()
 
-    # Determine if this is initial message or continuation
-    if task_id:
-        # Continuation (results coming back)
-        return handle_continuation(db, principal, msg, data)
-    else:
-        # New task (initial batch)
-        return handle_new_task(db, principal, msg, data)
-
-
-def handle_new_task(db, principal, msg, data):
-    message_id = msg.get("messageId")
-    context_id = msg.get("contextId", new_id())
-    parts = msg.get("parts", [])
-
-    # Message deduplication
-    msg_hash = hash_message(msg)
     cursor = db.execute("SELECT task_id FROM message_dedup WHERE principal = ? AND message_hash = ?", (principal, msg_hash))
     existing = cursor.fetchone()
     if existing:
-        # Return existing task
         task_id = existing[0]
-        cursor2 = db.execute("SELECT status, history_json FROM tasks WHERE task_id = ? AND principal = ?", (task_id, principal))
-        task_row = cursor2.fetchone()
-        if task_row:
-            return build_task_response(task_id, context_id, task_row[0], json.loads(task_row[1]))
+        cursor2 = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ?", (task_id,))
+        row = cursor2.fetchone()
+        if row:
+            return make_task_response(task_id, row[2], row[0], json.loads(row[1]))
 
-    # Parse the batch
+    # Parse batch
     batch_data = None
     for part in parts:
         if part.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
@@ -302,16 +275,13 @@ def handle_new_task(db, principal, msg, data):
             break
 
     if not batch_data:
-        return error_resp("INVALID_REQUEST", "Missing invoice-claim-batch part", 400)
+        return a2a_error("INVALID_REQUEST", "Missing invoice-claim-batch part", 400)
 
-    batch_id = batch_data.get("batchId")
+    batch_id = batch_data.get("batchId", "")
     policy_revision = batch_data.get("policyRevision", "")
     packages = batch_data.get("packages", [])
 
-    if not packages:
-        return error_resp("INVALID_REQUEST", "No packages in batch", 400)
-
-    # Process packages (with caching)
+    # Process packages
     proposals = []
     for pkg in packages:
         pkg_hash = sha256_hex(canonical_json(pkg))
@@ -342,60 +312,48 @@ def handle_new_task(db, principal, msg, data):
         proposals.append(proposal)
 
     # Build proposal artifact
-    proposal_artifact = {
-        "batchId": batch_id,
-        "proposals": proposals
-    }
+    proposal_data = {"batchId": batch_id, "proposals": proposals}
 
-    # Create task
+    # Create task with history
     task_id = "task-" + new_id()[:20]
+    agent_msg = {
+        "messageId": "msg-" + new_id()[:20],
+        "role": "ROLE_AGENT",
+        "parts": [{"mediaType": "application/vnd.ga5.invoice-action-proposals+json", "data": proposal_data}]
+    }
+    history = [msg, agent_msg]
 
-    # History: initial message + our response
-    history = [
-        msg,
-        {
-            "messageId": "msg-" + new_id()[:20],
-            "role": "ROLE_AGENT",
-            "parts": [{
-                "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
-                "data": proposal_artifact
-            }]
-        }
-    ]
-
-    # Store task
-    db.execute("INSERT INTO tasks (task_id, principal, context_id, status, history_json) VALUES (?, ?, ?, ?, ?)",
-               (task_id, principal, context_id, "TASK_STATE_INPUT_REQUIRED", json.dumps(history)))
+    # Store
+    db.execute("INSERT INTO tasks (task_id, principal, context_id, status, history_json, proposals_json, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (task_id, principal, context_id, "TASK_STATE_INPUT_REQUIRED", json.dumps(history), json.dumps({p["packageId"]: p for p in proposals}), batch_id))
     db.execute("INSERT OR REPLACE INTO message_dedup (principal, message_hash, task_id) VALUES (?, ?, ?)",
                (principal, msg_hash, task_id))
     db.commit()
 
-    return build_task_response(task_id, context_id, "TASK_STATE_INPUT_REQUIRED", history)
+    return make_task_response(task_id, context_id, "TASK_STATE_INPUT_REQUIRED", history)
 
 
-def handle_continuation(db, principal, msg, data):
+def handle_continuation(principal, msg, data):
     task_id = msg.get("taskId")
     context_id = msg.get("contextId", "")
     parts = msg.get("parts", [])
 
-    # Verify task belongs to this principal
-    cursor = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ? AND principal = ?", (task_id, principal))
-    task_row = cursor.fetchone()
-    if not task_row:
-        return error_resp("TASK_NOT_FOUND", "Task not found", 404)
+    db = get_db()
+    cursor = db.execute("SELECT status, history_json, context_id, proposals_json, batch_id FROM tasks WHERE task_id = ? AND principal = ?",
+                        (task_id, principal))
+    row = cursor.fetchone()
+    if not row:
+        return a2a_error("TASK_NOT_FOUND", "Task not found or access denied", 404)
 
-    current_status, history_json, stored_context = task_row
+    status, history_json, stored_ctx, proposals_json, batch_id = row
     history = json.loads(history_json)
+    stored_proposals = json.loads(proposals_json)
 
-    # If already completed, reject
-    if current_status == "COMPLETED":
-        return error_resp("TASK_ALREADY_COMPLETED", "Task already completed", 409)
-    if current_status == "CANCELED":
-        return error_resp("TASK_CANCELED", "Task was canceled", 409)
+    if status in ("COMPLETED", "CANCELED"):
+        return a2a_error("TASK_STATE_INPUT_REQUIRED", "Task already in terminal state", 409)
 
-    # Verify context matches
-    if context_id and context_id != stored_context:
-        return error_resp("CONTEXT_MISMATCH", "Context ID mismatch", 400)
+    if context_id and context_id != stored_ctx:
+        return a2a_error("CONTEXT_MISMATCH", "Context mismatch", 400)
 
     # Parse results
     results_data = None
@@ -405,161 +363,142 @@ def handle_continuation(db, principal, msg, data):
             break
 
     if not results_data:
-        return error_resp("INVALID_REQUEST", "Missing results part", 400)
+        return a2a_error("INVALID_REQUEST", "Missing results", 400)
 
-    # Get our proposals from history
-    our_proposals = {}
-    for h_msg in history:
-        if h_msg.get("role") == "ROLE_AGENT":
-            for part in h_msg.get("parts", []):
-                if part.get("mediaType") == "application/vnd.ga5.invoice-action-proposals+json":
-                    for p in part.get("data", {}).get("proposals", []):
-                        our_proposals[p["packageId"]] = p
-
-    # Validate results against our proposals
-    batch_id = results_data.get("batchId")
     results = results_data.get("results", [])
 
-    executions = []
+    # Validate bindings
     for result in results:
         pkg_id = result.get("packageId")
         action_id = result.get("actionId")
         action = result.get("action")
-        outcome = result.get("outcome")
-        receipt_nonce = result.get("receiptNonce")
 
-        # Verify matches stored proposal
-        if pkg_id not in our_proposals:
-            return error_resp("INVALID_BINDING", f"Unknown package {pkg_id}", 400)
+        if pkg_id not in stored_proposals:
+            return a2a_error("INVALID_BINDING", f"Unknown package {pkg_id}", 400)
+        prop = stored_proposals[pkg_id]
+        if action_id != prop["actionId"]:
+            return a2a_error("INVALID_BINDING", "ActionId mismatch", 400)
+        if action != prop["action"]:
+            return a2a_error("INVALID_BINDING", "Action mismatch", 400)
 
-        stored = our_proposals[pkg_id]
-        if action_id != stored["actionId"]:
-            return error_resp("INVALID_BINDING", "ActionId mismatch", 400)
-        if action != stored["action"]:
-            return error_resp("INVALID_BINDING", "Action mismatch", 400)
-
-        if outcome == "ACCEPTED":
+    # Build executions (accepted only)
+    executions = []
+    for result in results:
+        if result.get("outcome") == "ACCEPTED":
+            prop = stored_proposals[result["packageId"]]
             executions.append({
-                "packageId": pkg_id,
-                "actionId": action_id,
-                "action": action,
-                "receiptNonce": receipt_nonce,
-                "facts": stored["facts"],
-                "evidenceRefs": stored["evidenceRefs"]
+                "packageId": result["packageId"],
+                "actionId": result["actionId"],
+                "action": result["action"],
+                "receiptNonce": result.get("receiptNonce", ""),
+                "facts": prop["facts"],
+                "evidenceRefs": prop["evidenceRefs"]
             })
-        # REJECTED ones are not included in executions
 
-    # Build receipt artifact
-    receipt_artifact = {
-        "batchId": batch_id,
-        "executions": executions
-    }
+    receipt_data = {"batchId": batch_id, "executions": executions}
 
-    # Add continuation message and our response to history
+    # Update history
     history.append(msg)
-    agent_msg = {
+    agent_resp_msg = {
         "messageId": "msg-" + new_id()[:20],
         "role": "ROLE_AGENT",
         "parts": [
-            {
-                "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
-                "data": {"batchId": batch_id, "proposals": list(our_proposals.values())}
-            },
-            {
-                "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
-                "data": receipt_artifact
-            }
+            {"mediaType": "application/vnd.ga5.invoice-action-proposals+json",
+             "data": {"batchId": batch_id, "proposals": list(stored_proposals.values())}},
+            {"mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+             "data": receipt_data}
         ]
     }
-    history.append(agent_msg)
+    history.append(agent_resp_msg)
 
-    # Mark task completed
+    # Complete task
     db.execute("UPDATE tasks SET status = 'COMPLETED', history_json = ? WHERE task_id = ?",
                (json.dumps(history), task_id))
     db.commit()
 
-    return build_task_response(task_id, stored_context, "COMPLETED", history)
+    return make_task_response(task_id, stored_ctx, "COMPLETED", history)
 
 
-def build_task_response(task_id, context_id, status, history):
-    # Trim history to last 20 messages
-    trimmed = history[-20:] if len(history) > 20 else history
-
-    task = {
+def make_task_response(task_id, context_id, status, history):
+    task_obj = {
         "task": {
             "id": task_id,
             "contextId": context_id,
             "status": status,
-            "history": trimmed
+            "history": history[-20:]
         }
     }
-    return Response(json.dumps(task), status=200, content_type="application/a2a+json")
+    return a2a_response(task_obj)
 
 
 @app.route("/tasks/<task_id>", methods=["GET"])
 def get_task(task_id):
     principal = get_principal()
     if not principal:
-        return error_resp("UNAUTHORIZED", "Missing Bearer token", 401)
+        return a2a_error("ROLE_USER", "Unauthorized", 401)
+
+    err = check_a2a_headers_get()
+    if err:
+        return err
 
     db = get_db()
     cursor = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ? AND principal = ?", (task_id, principal))
     row = cursor.fetchone()
     if not row:
-        return error_resp("TASK_NOT_FOUND", "Task not found", 404)
+        return a2a_error("TASK_NOT_FOUND", "Not found", 404)
 
-    status, history_json, context_id = row
-    history = json.loads(history_json)
-    return build_task_response(task_id, context_id, status, history)
+    return make_task_response(task_id, row[2], row[0], json.loads(row[1]))
 
 
 @app.route("/tasks", methods=["GET"])
 def list_tasks():
     principal = get_principal()
     if not principal:
-        return error_resp("UNAUTHORIZED", "Missing Bearer token", 401)
+        return a2a_error("ROLE_USER", "Unauthorized", 401)
 
     db = get_db()
-    cursor = db.execute("SELECT task_id, status, history_json, context_id FROM tasks WHERE principal = ? ORDER BY created_at DESC", (principal,))
+    cursor = db.execute("SELECT task_id, status, history_json, context_id FROM tasks WHERE principal = ?", (principal,))
     rows = cursor.fetchall()
 
     tasks = []
-    for row in rows:
-        tid, status, hist_json, ctx_id = row
-        history = json.loads(hist_json)
+    for r in rows:
         tasks.append({
-            "id": tid,
-            "contextId": ctx_id,
-            "status": status,
-            "history": history[-20:]
+            "id": r[0],
+            "contextId": r[3],
+            "status": r[1],
+            "history": json.loads(r[2])[-20:]
         })
 
-    return Response(json.dumps({"tasks": tasks}), status=200, content_type="application/a2a+json")
+    return a2a_response({"tasks": tasks})
 
 
 @app.route("/tasks/<task_id>:cancel", methods=["POST"])
 def cancel_task(task_id):
     principal = get_principal()
     if not principal:
-        return error_resp("UNAUTHORIZED", "Missing Bearer token", 401)
+        return a2a_error("ROLE_USER", "Unauthorized", 401)
 
     db = get_db()
     cursor = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ? AND principal = ?", (task_id, principal))
     row = cursor.fetchone()
     if not row:
-        return error_resp("TASK_NOT_FOUND", "Task not found", 404)
+        return a2a_error("TASK_NOT_FOUND", "Not found", 404)
 
-    status, history_json, context_id = row
+    if row[0] in ("COMPLETED", "CANCELED"):
+        return a2a_error("INVALID_STATE", "Task in terminal state", 409)
 
-    if status in ("COMPLETED", "CANCELED"):
-        return error_resp("TASK_FINAL", "Task already in terminal state", 409)
-
-    # Cancel the task
     db.execute("UPDATE tasks SET status = 'CANCELED' WHERE task_id = ?", (task_id,))
     db.commit()
 
-    history = json.loads(history_json)
-    return build_task_response(task_id, context_id, "CANCELED", history)
+    return make_task_response(task_id, row[2], "CANCELED", json.loads(row[1]))
+
+
+def check_a2a_headers_get():
+    """For GET requests, just check version."""
+    version = request.headers.get("A2A-Version", "")
+    if version and version != "1.0":
+        return a2a_error("VERSION_NOT_SUPPORTED", "Only A2A-Version: 1.0 supported", 400)
+    return None
 
 
 @app.route("/", methods=["GET"])
