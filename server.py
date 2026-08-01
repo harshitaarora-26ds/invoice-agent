@@ -87,18 +87,19 @@ def get_principal():
 
 def check_a2a_headers():
     """Check A2A version and content type. Returns error response or None."""
-    # Check A2A-Version header
-    version = request.headers.get("A2A-Version", "")
-    if version and version != "1.0":
-        return a2a_error("VERSION_NOT_SUPPORTED", "Only A2A-Version: 1.0 is supported", 400)
-    if not version:
-        return a2a_error("VERSION_REQUIRED", "A2A-Version header required", 400)
+    # Check A2A-Version header - MUST be present and MUST be 1.0
+    version = request.headers.get("A2A-Version")
+    if version is None:
+        # Missing version header - some implementations require it
+        return a2a_error("TASK_STATE_INPUT_REQUIRED", "A2A-Version header required", 400)
+    if version != "1.0":
+        return a2a_error("TASK_STATE_INPUT_REQUIRED", "Unsupported A2A version", 400)
 
     # Check content type for POST
     if request.method == "POST":
         ct = request.content_type or ""
         if "application/a2a+json" not in ct:
-            return a2a_error("INVALID_MEDIA_TYPE", "Content-Type must be application/a2a+json", 400)
+            return a2a_error("TASK_STATE_INPUT_REQUIRED", "Content-Type must be application/a2a+json", 400)
 
     return None
 
@@ -254,7 +255,7 @@ def handle_new_task(principal, msg, data):
     parts = msg.get("parts", [])
     config = data.get("configuration", {})
 
-    # Dedup by message content
+    # Dedup by message content hash
     msg_hash = hash_message_content(msg)
     db = get_db()
 
@@ -437,17 +438,23 @@ def get_task(task_id):
     if not principal:
         return a2a_error("ROLE_USER", "Unauthorized", 401)
 
-    err = check_a2a_headers_get()
-    if err:
-        return err
+    # Check A2A version for GET
+    version = request.headers.get("A2A-Version")
+    if version is not None and version != "1.0":
+        return a2a_error("TASK_STATE_INPUT_REQUIRED", "Unsupported version", 400)
 
     db = get_db()
-    cursor = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ? AND principal = ?", (task_id, principal))
+    # First check if task exists at all
+    cursor = db.execute("SELECT principal, status, history_json, context_id FROM tasks WHERE task_id = ?", (task_id,))
     row = cursor.fetchone()
     if not row:
         return a2a_error("TASK_NOT_FOUND", "Not found", 404)
 
-    return make_task_response(task_id, row[2], row[0], json.loads(row[1]))
+    # Check ownership
+    if row[0] != principal:
+        return a2a_error("TASK_NOT_FOUND", "Not found", 403)
+
+    return make_task_response(task_id, row[3], row[1], json.loads(row[2]))
 
 
 @app.route("/tasks", methods=["GET"])
@@ -455,6 +462,10 @@ def list_tasks():
     principal = get_principal()
     if not principal:
         return a2a_error("ROLE_USER", "Unauthorized", 401)
+
+    version = request.headers.get("A2A-Version")
+    if version is not None and version != "1.0":
+        return a2a_error("TASK_STATE_INPUT_REQUIRED", "Unsupported version", 400)
 
     db = get_db()
     cursor = db.execute("SELECT task_id, status, history_json, context_id FROM tasks WHERE principal = ?", (principal,))
@@ -478,27 +489,28 @@ def cancel_task(task_id):
     if not principal:
         return a2a_error("ROLE_USER", "Unauthorized", 401)
 
+    # Check A2A headers for POST
+    err = check_a2a_headers()
+    if err:
+        return err
+
     db = get_db()
-    cursor = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ? AND principal = ?", (task_id, principal))
+    # Check existence first
+    cursor = db.execute("SELECT principal, status, history_json, context_id FROM tasks WHERE task_id = ?", (task_id,))
     row = cursor.fetchone()
     if not row:
         return a2a_error("TASK_NOT_FOUND", "Not found", 404)
 
-    if row[0] in ("COMPLETED", "CANCELED"):
+    if row[0] != principal:
+        return a2a_error("TASK_NOT_FOUND", "Not found", 403)
+
+    if row[1] in ("COMPLETED", "CANCELED"):
         return a2a_error("INVALID_STATE", "Task in terminal state", 409)
 
     db.execute("UPDATE tasks SET status = 'CANCELED' WHERE task_id = ?", (task_id,))
     db.commit()
 
-    return make_task_response(task_id, row[2], "CANCELED", json.loads(row[1]))
-
-
-def check_a2a_headers_get():
-    """For GET requests, just check version."""
-    version = request.headers.get("A2A-Version", "")
-    if version and version != "1.0":
-        return a2a_error("VERSION_NOT_SUPPORTED", "Only A2A-Version: 1.0 supported", 400)
-    return None
+    return make_task_response(task_id, row[3], "CANCELED", json.loads(row[2]))
 
 
 @app.route("/", methods=["GET"])
