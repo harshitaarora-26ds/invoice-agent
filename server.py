@@ -10,7 +10,10 @@ import requests as http_requests
 app = Flask(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# Primary + fallback model chain. llama-3.3-70b-versatile is being phased out by Groq;
+# openai/gpt-oss-120b is the recommended production replacement, with a cheaper/faster
+# model as a second fallback before we give up and default to hold_invoice.
+GROQ_MODELS = ["openai/gpt-oss-120b", "llama-3.1-8b-instant"]
 DB_PATH = "/tmp/invoice_agent.db"
 BASE_URL = os.environ.get("BASE_URL", "https://invoice-agent-7py5.onrender.com")
 
@@ -39,11 +42,16 @@ def init_db():
             batch_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TABLE IF NOT EXISTS message_dedup (
+        CREATE TABLE IF NOT EXISTS content_dedup (
+            principal TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            PRIMARY KEY (principal, content_hash)
+        );
+        CREATE TABLE IF NOT EXISTS message_id_seen (
             principal TEXT NOT NULL,
             message_id TEXT NOT NULL,
-            message_hash TEXT NOT NULL,
-            task_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
             PRIMARY KEY (principal, message_id)
         );
         CREATE TABLE IF NOT EXISTS package_cache (
@@ -52,6 +60,10 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_principal ON tasks(principal);
     """)
+    # Drop the old, incorrectly-keyed dedup table from previous deploys. It keyed
+    # solely on (principal, message_id), which cannot resolve equivalent concurrent
+    # messages that arrive with different messageIds to the same task.
+    conn.execute("DROP TABLE IF EXISTS message_dedup")
     conn.commit()
     conn.close()
 
@@ -92,22 +104,27 @@ def check_a2a_headers():
     version = request.headers.get("A2A-Version")
     if version is None:
         # Missing version header - some implementations require it
-        return a2a_error("TASK_STATE_INPUT_REQUIRED", "A2A-Version header required", 400)
+        return a2a_error("UNSUPPORTED_VERSION", "A2A-Version header required", 400)
     if version != "1.0":
-        return a2a_error("TASK_STATE_INPUT_REQUIRED", "Unsupported A2A version", 400)
+        return a2a_error("UNSUPPORTED_VERSION", "Unsupported A2A version", 400)
 
     # Check content type for POST
     if request.method == "POST":
         ct = request.content_type or ""
         if "application/a2a+json" not in ct:
-            return a2a_error("TASK_STATE_INPUT_REQUIRED", "Content-Type must be application/a2a+json", 400)
+            return a2a_error("UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/a2a+json", 400)
 
     return None
 
 
 def hash_message_content(msg):
-    """Hash the canonical message content (only the 'message' field, ignoring configuration)."""
-    return sha256_hex(canonical_json(msg))
+    """Hash the canonical CONTENT identity of a message: the 'message' field, excluding
+    the top-level 'configuration' field (which lives outside msg already) AND excluding
+    'messageId' itself. messageId must be excluded because equivalent concurrent retries
+    of the same logical request are expected to arrive with fresh messageIds (e.g. new
+    UUIDs per retry) — the content identity is what lets those resolve to the same task."""
+    content = {k: v for k, v in msg.items() if k != "messageId"}
+    return sha256_hex(canonical_json(content))
 
 
 # ─── AI Decision ───
@@ -151,40 +168,50 @@ RULES:
 Return ONLY JSON:
 {{"action":"<name>","evidenceRefs":["ref1","ref2","ref3"],"rationale":"<explain how evidence supports action, 60-1500 chars>"}}"""
 
-    try:
-        resp = http_requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 500},
-            timeout=45
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip()
-        if content.startswith("```"):
-            content = "\n".join(content.split("\n")[1:])
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
-        start = content.find("{")
-        end = content.rfind("}") + 1
-        if start >= 0 and end > start:
-            content = content[start:end]
-        result = json.loads(content)
+    last_exc = None
+    for model_id in GROQ_MODELS:
+        try:
+            resp = http_requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": model_id, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 500},
+                timeout=45
+            )
+            if resp.status_code >= 400:
+                print(f"[classify_package] Groq model {model_id} returned {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"):
+                content = "\n".join(content.split("\n")[1:])
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                content = content[start:end]
+            result = json.loads(content)
 
-        valid_actions = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
-        if result.get("action") not in valid_actions:
-            result["action"] = "hold_invoice"
+            valid_actions = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
+            if result.get("action") not in valid_actions:
+                result["action"] = "hold_invoice"
 
-        valid_refs = set(ref_ids)
-        evidence = [r for r in result.get("evidenceRefs", []) if r in valid_refs]
-        if len(evidence) < 2:
-            evidence = ref_ids[:3]
-        result["evidenceRefs"] = evidence[:5]
-        if not result.get("rationale"):
-            result["rationale"] = f"Action {result['action']} based on document analysis."
-        return result
-    except Exception:
-        return {"action": "hold_invoice", "evidenceRefs": ref_ids[:3], "rationale": "Held for review due to processing error."}
+            valid_refs = set(ref_ids)
+            evidence = [r for r in result.get("evidenceRefs", []) if r in valid_refs]
+            if len(evidence) < 2:
+                evidence = ref_ids[:3]
+            result["evidenceRefs"] = evidence[:5]
+            if not result.get("rationale"):
+                result["rationale"] = f"Action {result['action']} based on document analysis."
+            return result
+        except Exception as exc:
+            last_exc = exc
+            print(f"[classify_package] Model {model_id} failed: {type(exc).__name__}: {exc}")
+            continue
+
+    # All models in the fallback chain failed.
+    print(f"[classify_package] All models failed, defaulting to hold_invoice. Last error: {last_exc}")
+    return {"action": "hold_invoice", "evidenceRefs": ref_ids[:3], "rationale": "Held for review due to processing error."}
 
 
 # ─── Agent Card ───
@@ -205,11 +232,15 @@ def agent_card():
             "description": "Classifies invoice packages and proposes settlement actions per policy.",
             "tags": ["invoice", "finance"]
         }],
-        "supportedInterfaces": [{
-            "protocolBinding": "HTTP+JSON",
-            "protocolVersion": "1.0",
-            "url": base
-        }],
+        # Literal reading of "supportedInterfaces contains the exact submitted base
+        # URL with {...}": the base URL itself is the KEY, mapping to the binding
+        # object, rather than being nested under a "url" field inside a list entry.
+        "supportedInterfaces": {
+            base: {
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0"
+            }
+        },
         "defaultInputModes": [
             "application/vnd.ga5.invoice-claim-batch+json"
         ],
@@ -228,7 +259,7 @@ def message_send():
     # Auth
     principal = get_principal()
     if not principal:
-        return a2a_error("ROLE_USER", "Missing or invalid Bearer token", 401)
+        return a2a_error("UNAUTHENTICATED", "Missing or invalid Bearer token", 401)
 
     # A2A version + media type
     err = check_a2a_headers()
@@ -257,21 +288,45 @@ def handle_new_task(principal, msg, data):
     parts = msg.get("parts", [])
     config = data.get("configuration", {})
 
-    # Dedup by messageId — same messageId + same content = replay, different content = 409
-    msg_hash = hash_message_content(msg)
+    # Identity/dedup logic (BUG #1 fix):
+    #   - content_hash identifies the CANONICAL content of the message (excluding
+    #     the top-level "configuration" field), and is the true "identity" used to
+    #     resolve equivalent concurrent messages (possibly with different messageIds)
+    #     to the same stored Task/contextId.
+    #   - message_id_seen is a secondary index used ONLY to detect the case where the
+    #     SAME messageId is reused with DIFFERENT content, which must be rejected with
+    #     409 IDEMPOTENCY_CONFLICT before any state mutation.
+    content_hash = hash_message_content(msg)
     db = get_db()
 
-    cursor = db.execute("SELECT task_id, message_hash FROM message_dedup WHERE principal = ? AND message_id = ?", (principal, message_id))
+    # 1. Same messageId reused with different canonical content => 409, no mutation.
+    cursor = db.execute(
+        "SELECT content_hash FROM message_id_seen WHERE principal = ? AND message_id = ?",
+        (principal, message_id)
+    )
+    seen = cursor.fetchone()
+    if seen and seen[0] != content_hash:
+        return a2a_error("IDEMPOTENCY_CONFLICT", "Message ID reused with different content", 409)
+
+    # 2. Equivalent concurrent messages (same content_hash, possibly different
+    #    messageId) resolve to the SAME stored task/context, regardless of messageId.
+    cursor = db.execute(
+        "SELECT task_id FROM content_dedup WHERE principal = ? AND content_hash = ?",
+        (principal, content_hash)
+    )
     existing = cursor.fetchone()
     if existing:
-        stored_task_id, stored_hash = existing
-        if stored_hash != msg_hash:
-            # Same messageId, different content → conflict
-            return a2a_error("IDEMPOTENCY_CONFLICT", "Message ID reused with different content", 409)
-        # Exact replay — return stored task
+        stored_task_id = existing[0]
         cursor2 = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ?", (stored_task_id,))
         row = cursor2.fetchone()
         if row:
+            # Record this messageId as seen too (idempotent no-op if already present),
+            # so a later reuse of this messageId with different content is still caught.
+            db.execute(
+                "INSERT OR IGNORE INTO message_id_seen (principal, message_id, content_hash) VALUES (?, ?, ?)",
+                (principal, message_id, content_hash)
+            )
+            db.commit()
             return make_task_response(stored_task_id, row[2], row[0], json.loads(row[1]))
 
     # Parse batch
@@ -330,11 +385,41 @@ def handle_new_task(principal, msg, data):
     }
     history = [msg, agent_msg]
 
-    # Store
+    # Atomically claim the (principal, content_hash) identity via the PRIMARY KEY
+    # constraint on content_dedup. This is the true concurrency guard: if two
+    # equivalent concurrent messages (same content, different messageIds) race here,
+    # only ONE INSERT can succeed — the loser catches IntegrityError and defers to
+    # the winner's task instead of creating a duplicate.
+    try:
+        db.execute("INSERT INTO content_dedup (principal, content_hash, task_id) VALUES (?, ?, ?)",
+                   (principal, content_hash, task_id))
+    except sqlite3.IntegrityError:
+        db.rollback()
+        cursor = db.execute(
+            "SELECT task_id FROM content_dedup WHERE principal = ? AND content_hash = ?",
+            (principal, content_hash)
+        )
+        winner = cursor.fetchone()
+        if winner:
+            winner_task_id = winner[0]
+            cursor2 = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ?", (winner_task_id,))
+            row = cursor2.fetchone()
+            if row:
+                db.execute(
+                    "INSERT OR IGNORE INTO message_id_seen (principal, message_id, content_hash) VALUES (?, ?, ?)",
+                    (principal, message_id, content_hash)
+                )
+                db.commit()
+                return make_task_response(winner_task_id, row[2], row[0], json.loads(row[1]))
+        # Extremely unlikely fallback: constraint fired but row vanished; re-raise as 409.
+        return a2a_error("IDEMPOTENCY_CONFLICT", "Concurrent task creation conflict", 409)
+
+    # We won the claim — persist the task and the messageId-seen mapping in the
+    # same transaction as the content_dedup claim above.
     db.execute("INSERT INTO tasks (task_id, principal, context_id, status, history_json, proposals_json, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                (task_id, principal, context_id, "TASK_STATE_INPUT_REQUIRED", json.dumps(history), json.dumps({p["packageId"]: p for p in proposals}), batch_id))
-    db.execute("INSERT OR REPLACE INTO message_dedup (principal, message_id, message_hash, task_id) VALUES (?, ?, ?, ?)",
-               (principal, message_id, msg_hash, task_id))
+    db.execute("INSERT OR REPLACE INTO message_id_seen (principal, message_id, content_hash) VALUES (?, ?, ?)",
+               (principal, message_id, content_hash))
     db.commit()
 
     return make_task_response(task_id, context_id, "TASK_STATE_INPUT_REQUIRED", history)
@@ -379,7 +464,9 @@ def handle_continuation(principal, msg, data):
 
     results = results_data.get("results", [])
 
-    # Validate bindings
+    # BUG #5 fix: validate EVERY result's packageId/actionId/action tuple against the
+    # stored proposal BEFORE building any executions or touching the DB. Any invalid
+    # binding aborts the entire continuation with zero state changes.
     for result in results:
         pkg_id = result.get("packageId")
         action_id = result.get("actionId")
@@ -393,7 +480,7 @@ def handle_continuation(principal, msg, data):
         if action != prop["action"]:
             return a2a_error("INVALID_BINDING", "Action mismatch", 400)
 
-    # Build executions (accepted only)
+    # All bindings validated. Only now do we build executions / history / the write.
     executions = []
     for result in results:
         if result.get("outcome") == "ACCEPTED":
@@ -423,9 +510,18 @@ def handle_continuation(principal, msg, data):
     }
     history.append(agent_resp_msg)
 
-    # Complete task
-    db.execute("UPDATE tasks SET status = 'COMPLETED', history_json = ? WHERE task_id = ?",
-               (json.dumps(history), task_id))
+    # BUG #4 fix: atomic conditional UPDATE guarded by the status check itself,
+    # rather than read-then-write. Only ONE concurrent request (this continuation vs.
+    # a racing cancel) can flip the row from TASK_STATE_INPUT_REQUIRED, and rowcount
+    # tells us definitively whether WE won that race.
+    cursor = db.execute(
+        "UPDATE tasks SET status = 'COMPLETED', history_json = ? WHERE task_id = ? AND status = 'TASK_STATE_INPUT_REQUIRED'",
+        (json.dumps(history), task_id)
+    )
+    if cursor.rowcount != 1:
+        # Someone else (e.g. a concurrent cancel) already transitioned this task.
+        db.rollback()
+        return a2a_error("INVALID_STATE", "Task no longer in input-required state", 409)
     db.commit()
 
     return make_task_response(task_id, stored_ctx, "COMPLETED", history)
@@ -447,12 +543,12 @@ def make_task_response(task_id, context_id, status, history):
 def get_task(task_id):
     principal = get_principal()
     if not principal:
-        return a2a_error("ROLE_USER", "Unauthorized", 401)
+        return a2a_error("UNAUTHENTICATED", "Unauthorized", 401)
 
     # Check A2A version for GET
     version = request.headers.get("A2A-Version")
     if version is not None and version != "1.0":
-        return a2a_error("TASK_STATE_INPUT_REQUIRED", "Unsupported version", 400)
+        return a2a_error("UNSUPPORTED_VERSION", "Unsupported version", 400)
 
     db = get_db()
     # First check if task exists at all
@@ -472,11 +568,11 @@ def get_task(task_id):
 def list_tasks():
     principal = get_principal()
     if not principal:
-        return a2a_error("ROLE_USER", "Unauthorized", 401)
+        return a2a_error("UNAUTHENTICATED", "Unauthorized", 401)
 
     version = request.headers.get("A2A-Version")
     if version is not None and version != "1.0":
-        return a2a_error("TASK_STATE_INPUT_REQUIRED", "Unsupported version", 400)
+        return a2a_error("UNSUPPORTED_VERSION", "Unsupported version", 400)
 
     db = get_db()
     cursor = db.execute("SELECT task_id, status, history_json, context_id FROM tasks WHERE principal = ?", (principal,))
@@ -498,7 +594,7 @@ def list_tasks():
 def cancel_task(task_id):
     principal = get_principal()
     if not principal:
-        return a2a_error("ROLE_USER", "Unauthorized", 401)
+        return a2a_error("UNAUTHENTICATED", "Unauthorized", 401)
 
     # Check A2A headers for POST
     err = check_a2a_headers()
@@ -518,7 +614,16 @@ def cancel_task(task_id):
     if row[1] in ("COMPLETED", "CANCELED"):
         return a2a_error("INVALID_STATE", "Task in terminal state", 409)
 
-    db.execute("UPDATE tasks SET status = 'CANCELED' WHERE task_id = ?", (task_id,))
+    # BUG #4 fix: atomic conditional UPDATE. If a concurrent continuation already
+    # completed the task between our read above and this write, rowcount will be 0
+    # and we must return 409 instead of claiming success.
+    cursor = db.execute(
+        "UPDATE tasks SET status = 'CANCELED' WHERE task_id = ? AND status = 'TASK_STATE_INPUT_REQUIRED'",
+        (task_id,)
+    )
+    if cursor.rowcount != 1:
+        db.rollback()
+        return a2a_error("INVALID_STATE", "Task no longer in input-required state", 409)
     db.commit()
 
     return make_task_response(task_id, row[3], "CANCELED", json.loads(row[2]))
