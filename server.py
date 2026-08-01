@@ -41,9 +41,10 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS message_dedup (
             principal TEXT NOT NULL,
+            message_id TEXT NOT NULL,
             message_hash TEXT NOT NULL,
             task_id TEXT NOT NULL,
-            PRIMARY KEY (principal, message_hash)
+            PRIMARY KEY (principal, message_id)
         );
         CREATE TABLE IF NOT EXISTS package_cache (
             content_hash TEXT PRIMARY KEY,
@@ -190,6 +191,7 @@ Return ONLY JSON:
 
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 def agent_card():
+    base = BASE_URL.rstrip("/")
     card = {
         "name": "Invoice Action Agent",
         "description": "Reads invoice claim batches and proposes one settlement action per package.",
@@ -206,7 +208,7 @@ def agent_card():
         "supportedInterfaces": [{
             "protocolBinding": "HTTP+JSON",
             "protocolVersion": "1.0",
-            "url": BASE_URL
+            "url": base
         }],
         "defaultInputModes": [
             "application/vnd.ga5.invoice-claim-batch+json"
@@ -255,18 +257,22 @@ def handle_new_task(principal, msg, data):
     parts = msg.get("parts", [])
     config = data.get("configuration", {})
 
-    # Dedup by message content hash
+    # Dedup by messageId — same messageId + same content = replay, different content = 409
     msg_hash = hash_message_content(msg)
     db = get_db()
 
-    cursor = db.execute("SELECT task_id FROM message_dedup WHERE principal = ? AND message_hash = ?", (principal, msg_hash))
+    cursor = db.execute("SELECT task_id, message_hash FROM message_dedup WHERE principal = ? AND message_id = ?", (principal, message_id))
     existing = cursor.fetchone()
     if existing:
-        task_id = existing[0]
-        cursor2 = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ?", (task_id,))
+        stored_task_id, stored_hash = existing
+        if stored_hash != msg_hash:
+            # Same messageId, different content → conflict
+            return a2a_error("IDEMPOTENCY_CONFLICT", "Message ID reused with different content", 409)
+        # Exact replay — return stored task
+        cursor2 = db.execute("SELECT status, history_json, context_id FROM tasks WHERE task_id = ?", (stored_task_id,))
         row = cursor2.fetchone()
         if row:
-            return make_task_response(task_id, row[2], row[0], json.loads(row[1]))
+            return make_task_response(stored_task_id, row[2], row[0], json.loads(row[1]))
 
     # Parse batch
     batch_data = None
@@ -327,8 +333,8 @@ def handle_new_task(principal, msg, data):
     # Store
     db.execute("INSERT INTO tasks (task_id, principal, context_id, status, history_json, proposals_json, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                (task_id, principal, context_id, "TASK_STATE_INPUT_REQUIRED", json.dumps(history), json.dumps({p["packageId"]: p for p in proposals}), batch_id))
-    db.execute("INSERT OR REPLACE INTO message_dedup (principal, message_hash, task_id) VALUES (?, ?, ?)",
-               (principal, msg_hash, task_id))
+    db.execute("INSERT OR REPLACE INTO message_dedup (principal, message_id, message_hash, task_id) VALUES (?, ?, ?, ?)",
+               (principal, message_id, msg_hash, task_id))
     db.commit()
 
     return make_task_response(task_id, context_id, "TASK_STATE_INPUT_REQUIRED", history)
@@ -340,15 +346,20 @@ def handle_continuation(principal, msg, data):
     parts = msg.get("parts", [])
 
     db = get_db()
-    cursor = db.execute("SELECT status, history_json, context_id, proposals_json, batch_id FROM tasks WHERE task_id = ? AND principal = ?",
-                        (task_id, principal))
+    cursor = db.execute("SELECT principal, status, history_json, context_id, proposals_json, batch_id FROM tasks WHERE task_id = ?", (task_id,))
     row = cursor.fetchone()
     if not row:
-        return a2a_error("TASK_NOT_FOUND", "Task not found or access denied", 404)
+        return a2a_error("TASK_NOT_FOUND", "Task not found", 404)
 
-    status, history_json, stored_ctx, proposals_json, batch_id = row
-    history = json.loads(history_json)
-    stored_proposals = json.loads(proposals_json)
+    # Isolation check
+    if row[0] != principal:
+        return a2a_error("TASK_NOT_FOUND", "Task not found", 404)
+
+    status = row[1]
+    history = json.loads(row[2])
+    stored_ctx = row[3]
+    stored_proposals = json.loads(row[4])
+    batch_id = row[5]
 
     if status in ("COMPLETED", "CANCELED"):
         return a2a_error("TASK_STATE_INPUT_REQUIRED", "Task already in terminal state", 409)
@@ -450,9 +461,9 @@ def get_task(task_id):
     if not row:
         return a2a_error("TASK_NOT_FOUND", "Not found", 404)
 
-    # Check ownership
+    # Check ownership — never reveal existence to wrong principal
     if row[0] != principal:
-        return a2a_error("TASK_NOT_FOUND", "Not found", 403)
+        return a2a_error("TASK_NOT_FOUND", "Not found", 404)
 
     return make_task_response(task_id, row[3], row[1], json.loads(row[2]))
 
@@ -502,7 +513,7 @@ def cancel_task(task_id):
         return a2a_error("TASK_NOT_FOUND", "Not found", 404)
 
     if row[0] != principal:
-        return a2a_error("TASK_NOT_FOUND", "Not found", 403)
+        return a2a_error("TASK_NOT_FOUND", "Not found", 404)
 
     if row[1] in ("COMPLETED", "CANCELED"):
         return a2a_error("INVALID_STATE", "Task in terminal state", 409)
