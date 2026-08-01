@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: invoice-agent
+    runtime: docker
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: BASE_URL
+        sync: false
